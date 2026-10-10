@@ -1,0 +1,24 @@
+name: G3 MiniMax contract offline one-shot
+on:
+  push:
+    branches:
+      - poc/g3-minimax-contract-20261010
+    paths:
+      - .github/workflows/g3-minimax-contract-ci.yml
+permissions:
+  contents: read
+jobs:
+  minimax-contract-mock:
+    if: github.ref == 'refs/heads/poc/g3-minimax-contract-20261010'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Verify original budget and MiniMax wire contract offline
+        run: node --test poc/g3-guard/*.test.mjs

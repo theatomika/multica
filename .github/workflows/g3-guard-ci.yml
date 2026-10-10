@@ -1,0 +1,24 @@
+name: G3 mock budget guard one-shot
+on:
+  push:
+    branches:
+      - poc/g3-budget-guard-20261010
+    paths:
+      - .github/workflows/g3-guard-ci.yml
+permissions:
+  contents: read
+jobs:
+  mock-g3:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/poc/g3-budget-guard-20261010'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: false
+      - name: Run mock-only budget tests (zero provider calls)
+        run: node --test poc/g3-guard/budget-guard.test.mjs

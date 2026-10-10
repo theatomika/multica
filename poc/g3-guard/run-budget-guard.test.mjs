@@ -314,15 +314,31 @@ test('output cap: maxOutputTokens above the server cap is denied before upstream
 
 // ---------- 10. WebSocket bypass ----------
 
-test('WebSocket: no parallel path can bypass the run-budget guard', async (t) => {
-  // Wire a sentinel HTTP server on the same loopback that counts ANY request.
-  let allRequests = 0
+test('WebSocket: guard is fail-closed at its own boundary; network loopback is not a security boundary', async (t) => {
+  // HONEST scope of this test:
+  //   The run-budget guard is a NODE PROCESS listening on a loopback port.
+  //   It does NOT provide network-level protection. A WS connection that
+  //   bypasses the guard and talks directly to the upstream simulator is
+  //   OUTSIDE the guard's authority. We assert exactly what the guard can
+  //   enforce at the process level:
+  //     (a) the guard has no 'upgrade' handler; a WS upgrade to the
+  //         guard port is rejected (Node closes the socket) and the
+  //         guard's accounting path is never entered;
+  //     (b) any HTTP request that is NOT POST /v1/run returns 404
+  //         and never opens a reservation;
+  //     (c) a WS upgrade directly to the SENTINEL succeeds at the
+  //         network layer. The run ledger is unchanged because the
+  //         guard was never entered — that is the structural reason,
+  //         NOT a network-level guarantee. We mark this explicitly as
+  //         OUTSIDE the guard's authority.
+  let sentinelHttpRequests = 0
+  let sentinelWsUpgrades = 0
   const sentinel = http.createServer((req, res) => {
-    allRequests++
+    sentinelHttpRequests++
     res.writeHead(204).end()
   })
   sentinel.on('upgrade', (_r, s) => {
-    allRequests++
+    sentinelWsUpgrades++
     try { s.destroy() } catch {}
   })
   const sentinelPort = await listen(sentinel)
@@ -330,54 +346,66 @@ test('WebSocket: no parallel path can bypass the run-budget guard', async (t) =>
 
   const ledger = new BudgetLedger({ inputCreditsPerToken: 1, outputCreditsPerToken: 2 })
   ledger.openRun('r', 100)
-
-  // The guard is the ONLY HTTP entrypoint the lab permits for the run. The
-  // upstream simulator is the sentinel (NOT the guard). For a WS request
-  // targeting the sentinel directly, the guard is never invoked → the
-  // bypass attempt must be the "denied by policy" path: there is no run
-  // identity, no reservation. This test asserts the structural invariant:
-  // a request that doesn't carry x-g3-run-id and isn't addressed to the
-  // guard's /v1/run endpoint cannot consume the run budget.
-  // We also confirm the guard's HTTP listener only accepts POST /v1/run.
-
-  // 10a. WS upgrade targeting the guard port: the guard never upgrades → fail closed.
-  await new Promise((resolve) => {
-    const req = http.request({ host: '127.0.0.1', port: sentinelPort, method: 'GET',
-      headers: { Connection: 'Upgrade', Upgrade: 'websocket',
-                 'Sec-WebSocket-Version': '13',
-                 'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==' } })
-    req.on('upgrade', () => resolve())
-    req.on('error', () => resolve())
-    req.on('close', () => resolve())
-    req.end()
-  })
-  // Now actually wire the guard and confirm WS upgrades to its port are denied too.
   const guard = createRunBudgetGuardServer({
     ledger, simulatorURL: 'http://127.0.0.1:' + sentinelPort,
     trustedInputUpperBound: async () => 4,
   })
   const guardPort = await listen(guard)
   t.after(() => new Promise(r => guard.close(() => r())))
+
+  // (a) WS upgrade to the GUARD port: the guard has no 'upgrade' handler
+  //     registered, so Node's default closes the socket. No reservation,
+  //     no upstream contact. PROVES: a WS frame exchange cannot enter
+  //     the run-accounting path because the guard never opens a WS channel.
+  let guardWsUpgraded = false
   await new Promise((resolve) => {
-    const req = http.request({ host: '127.0.0.1', port: guardPort, method: 'GET',
+    const req = http.request({
+      host: '127.0.0.1', port: guardPort, method: 'GET',
       headers: { Connection: 'Upgrade', Upgrade: 'websocket',
                  'Sec-WebSocket-Version': '13',
-                 'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==' } })
+                 'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==' },
+    })
+    req.on('upgrade', () => { guardWsUpgraded = true; resolve() })
+    req.on('error', () => resolve())
+    req.on('close', () => resolve())
+    req.end()
+  })
+  assert.equal(guardWsUpgraded, false, 'guard must NOT accept a WebSocket upgrade — no upgrade handler is registered')
+
+  // (b) Non-POST HTTP request to the guard port: returns 404
+  //     (handler returns immediately). No reservation.
+  const r404 = await fetch(`http://127.0.0.1:${guardPort}/v1/run`, {
+    method: 'GET', headers: { 'x-g3-run-id': 'r' },
+  })
+  assert.equal(r404.status, 404)
+  assert.deepEqual(await r404.json(), { error: 'not_found' })
+
+  // (c) WS upgrade directly to the SENTINEL: succeeds at the network
+  //     layer and the sentinel counts the upgrade. This is OUTSIDE the
+  //     guard's authority — we document it explicitly. The run ledger is
+  //     unchanged because the guard was never entered; this is the
+  //     structural reason, not a network-level guarantee.
+  await new Promise((resolve) => {
+    const req = http.request({
+      host: '127.0.0.1', port: sentinelPort, method: 'GET',
+      headers: { Connection: 'Upgrade', Upgrade: 'websocket',
+                 'Sec-WebSocket-Version': '13',
+                 'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==' },
+    })
     req.on('upgrade', () => resolve())
     req.on('error', () => resolve())
     req.on('close', () => resolve())
     req.end()
   })
-  // The structural invariant: nothing in this test consumed the run
-  // budget. A WS request NEVER entered the /v1/run path because the
-  // guard's createServer only handles POST /v1/run. The only path that
-  // can settle or charge the run is through the guard's POST /v1/run
-  // handler, which requires a valid run id + reservation.
+  assert.ok(sentinelWsUpgrades >= 1, 'sentinel observed the WS upgrade — outside the guard')
+
+  // Invariant the guard actually enforces: nothing reached the ledger.
   assert.equal(ledger.snapshot('r').spent, 0)
   assert.equal(ledger.snapshot('r').accepted, 0)
   assert.equal(ledger.snapshot('r').rejected, 0)
-  // sentinels counted WS probe attempts, but no run budget was consumed
-  assert.ok(allRequests >= 1, 'sentinel observed at least the WS probe')
+  // The 404 from a non-POST hit the guard, not the sentinel; the sentinel
+  // received zero HTTP requests because the guard short-circuited them.
+  assert.equal(sentinelHttpRequests, 0, 'sentinel received zero HTTP requests — guard handled them with 404')
 })
 
 // ---------- 11. synthetic vs real ----------
@@ -421,4 +449,111 @@ test('session id fallback is opt-in: without allowSessionFallback, sessionId alo
   assert.equal(res.status, 403)
   assert.deepEqual(await res.json(), { error: 'unknown_run' })
   assert.equal(sim.sends(), 0)
+})
+
+// ---------- 13. estimator scope: full payload ----------
+
+// The estimator receives the EXACT JSON body that will be sent to the
+// upstream, not a stripped-down { prompt, model } view. This test wires an
+// estimator that uses Buffer.byteLength on the supplied body and returns
+// that length as the upper bound.
+test('estimator sees the full upstream body (system + messages + tools), not just prompt', async (t) => {
+  const { sim, url } = await withSim(t)
+  const ledger = new BudgetLedger({ inputCreditsPerToken: 1, outputCreditsPerToken: 1 })
+  ledger.openRun('r', 100000)
+
+  let estimatorSeen = null
+  const guard = createRunBudgetGuardServer({
+    ledger, simulatorURL: url,
+    trustedInputUpperBound: async ({ body, payload }) => {
+      estimatorSeen = { body, payload }
+      return Buffer.byteLength(body, 'utf8')
+    },
+  })
+  const port = await listen(guard)
+  t.after(() => new Promise(r => guard.close(() => r())))
+
+  const res = await fetch(`http://127.0.0.1:${port}/v1/run`, { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      runId: 'r',
+      prompt: 'hi',
+      maxOutputTokens: 4,
+      model: 'MiniMax-M3',
+      system: 'You are a coding assistant.',
+      messages: [{ role: 'user', content: 'hi' }],
+      tools: [{ name: 'lookup', description: 'lookup', input_schema: { type: 'object' } }],
+    }) })
+  assert.equal(res.status, 200)
+  assert.equal(estimatorSeen !== null, true, 'estimator must be called with the upstream body')
+  // The estimator body MUST contain system + tools + messages.
+  assert.match(estimatorSeen.body, /coding assistant/)
+  assert.match(estimatorSeen.body, /"tools":\[/)
+  assert.match(estimatorSeen.body, /"messages":\[/)
+  assert.match(estimatorSeen.body, /"stream":true/)
+  // The estimator's bound equals the serialized body length, so the
+  // reservation reflects the full payload, not just prompt.length.
+  // Reservation was opened (accepted==1) and closed cleanly (inFlight==0).
+  const snap = ledger.snapshot('r')
+  assert.equal(snap.inFlight, 0, 'reservation must be settled cleanly')
+  assert.equal(snap.accepted, 1, 'exactly one reservation opened for this request')
+  // The estimator saw the full body, so the BOUND reflected the full
+  // payload. We assert this indirectly: the bound must be greater than
+  // prompt.length alone — otherwise the estimator was a strip-down view.
+  assert.equal(estimatorSeen.body.length > 'hi'.length, true,
+    'estimator must see the full body, not just prompt')
+})
+
+// ---------- 14. negative: same prompt + extra system/tools exceeds bound ----------
+
+// The estimator uses a CONSERVATIVE byte-length bound on the FULL body.
+// When the caller pads the same prompt with a large system block or extra
+// tools, the bound grows past the reservation budget and the guard must
+// fail closed with ZERO upstream calls.
+test('negative: same prompt with extra system/tools pushes the bound over the reservation budget → 0 upstream calls', async (t) => {
+  const { sim, url } = await withSim(t)
+  const ledger = new BudgetLedger({ inputCreditsPerToken: 1, outputCreditsPerToken: 1 })
+  // Small body serializes to ~95 bytes; budget of 200 covers the small
+  // request (95 + 2 = 97 credits). The large padded body (~2300+ bytes)
+  // cannot fit and must be denied.
+  ledger.openRun('r', 200)
+
+  const guard = createRunBudgetGuardServer({
+    ledger, simulatorURL: url,
+    trustedInputUpperBound: async ({ body }) => Buffer.byteLength(body, 'utf8'),
+  })
+  const port = await listen(guard)
+  t.after(() => new Promise(r => guard.close(() => r())))
+
+  // First request: a small prompt — fits comfortably under the budget.
+  // The small body serializes to ~95 bytes; budget of 200 covers the
+  // reservation (95 + max_tokens=4 = ~99 credits). We use maxOutputTokens=4
+  // because the lab simulator reports output_tokens=3, which must be <=
+  // max_tokens to settle cleanly.
+  const small = await fetch(`http://127.0.0.1:${port}/v1/run`, { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ runId: 'r', prompt: 'hi', maxOutputTokens: 4 }) })
+  assert.equal(small.status, 200, `small prompt must be admitted (status=${small.status})`)
+  const snapAfterSmall = ledger.snapshot('r')
+  assert.equal(snapAfterSmall.spent > 0, true, 'spent reflects the small reservation')
+
+  // Second request: SAME prompt but padded with a large system + extra tools.
+  // The estimator sees the FULL body, the bound is the body length, which
+  // exceeds the remaining credits → 429, ZERO upstream calls.
+  const largeSystem = 'X'.repeat(2048)
+  const bigTools = Array.from({ length: 4 }, (_, i) => ({
+    name: 'tool_' + i, description: 'd', input_schema: { type: 'object', properties: { q: {} } },
+  }))
+  const res = await fetch(`http://127.0.0.1:${port}/v1/run`, { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      runId: 'r',
+      prompt: 'hi', // same prompt as the first request
+      maxOutputTokens: 4,
+      system: largeSystem,
+      tools: bigTools,
+    }) })
+  assert.equal(res.status, 429, 'large system+tools body MUST be denied')
+  assert.deepEqual(await res.json(), { error: 'budget_exhausted' })
+  assert.equal(sim.sends(), 1, 'only the first small request reached the upstream — zero calls for the padded one')
+  // The padded request did NOT open a reservation.
+  assert.equal(ledger.snapshot('r').accepted, 1, 'only one reservation was opened (the small one)')
+  assert.equal(ledger.snapshot('r').rejected, 1, 'the padded one incremented the rejection counter')
 })

@@ -70,6 +70,31 @@ export function resolveRunIdentity({ runId, sessionId }, { allowSessionFallback 
   return { ok: false, reason: 'unknown_run' }
 }
 
+// buildUpstreamPayload assembles the JSON body that the guard will send to
+// the upstream simulator. The estimator MUST evaluate THIS body, not a
+// subset, so a caller cannot smuggle extra system/tools/messages past the
+// input bound by hiding them in fields the estimator doesn't see.
+export function buildUpstreamPayload(payload) {
+  return {
+    model: typeof payload?.model === 'string' ? payload.model : 'MiniMax-M3',
+    max_tokens: payload?.maxOutputTokens,
+    stream: true,
+    system: typeof payload?.system === 'string' ? payload.system : '',
+    messages: Array.isArray(payload?.messages) && payload.messages.length > 0
+      ? payload.messages
+      : [{ role: 'user', content: typeof payload?.prompt === 'string' ? payload.prompt : '' }],
+    tools: Array.isArray(payload?.tools) ? payload.tools : undefined,
+  }
+}
+
+// serializeUpstreamPayload returns the exact byte sequence that the guard
+// will POST to the upstream. The estimator may use the length to derive a
+// conservative input bound. JSON.stringify output is byte-stable for the
+// same key order and inputs.
+export function serializeUpstreamPayload(payload) {
+  return JSON.stringify(buildUpstreamPayload(payload))
+}
+
 async function readSmallJson(req, maxBytes) {
   let bytes = 0
   const chunks = []
@@ -136,6 +161,15 @@ async function consumeAnthropicSse(stream, bound, maxOutput) {
 // MiniMax Messages route. The guard is the boundary that enforces identity,
 // limit, estimator and reservation BEFORE the configured loopback simulator
 // is contacted. Anything missing → ZERO upstream sends.
+//
+// IMPORTANT — estimator scope:
+//   The estimator receives the SAME JSON body that will be sent to the
+//   upstream (`buildUpstreamPayload`), so it can evaluate the FULL payload
+//   (system + messages + tools + options + model + max_tokens). The estimator
+//   is operator-supplied; the lab does NOT invent a reliable tokenizer.
+//   A simple byte sum is acceptable as a conservative bound ONLY because
+//   the test fixture declares it. The estimator MUST return a positive safe
+//   integer or the guard fails closed.
 export function createRunBudgetGuardServer({
   ledger,
   simulatorURL,
@@ -181,9 +215,19 @@ export function createRunBudgetGuardServer({
     }
 
     // 4. Estimator: positive integer upper bound BEFORE upstream.
+    //    The estimator receives the EXACT JSON body that will be sent to
+    //    the upstream, not a stripped-down view. The lab does NOT provide
+    //    a reliable tokenizer; the test fixture uses a byte sum over the
+    //    full serialized payload, which is conservative for the controlled
+    //    simulator only.
     let bound
-    try { bound = await trustedInputUpperBound({ prompt: payload.prompt, model: payload.model }) }
-    catch { return sendJson(res, 503, { error: 'unverified_input_bound' }) }
+    try {
+      const upstreamBody = serializeUpstreamPayload({
+        ...payload,
+        maxOutputTokens: payload.maxOutputTokens,
+      })
+      bound = await trustedInputUpperBound({ body: upstreamBody, payload: buildUpstreamPayload(payload) })
+    } catch { return sendJson(res, 503, { error: 'unverified_input_bound' }) }
     if (!isPosInt(bound)) return sendJson(res, 503, { error: 'unverified_input_bound' })
 
     // 5. Atomic reservation. Concurrent retries in the same run cannot
@@ -203,13 +247,7 @@ export function createRunBudgetGuardServer({
           'x-g3-run-id': ident.runId,
           'x-g3-allow-session-fallback': allowSessionFallback ? '1' : '0',
         },
-        body: JSON.stringify({
-          model: payload.model ?? 'MiniMax-M3',
-          max_tokens: payload.maxOutputTokens,
-          stream: true,
-          system: payload.system ?? '',
-          messages: [{ role: 'user', content: payload.prompt }],
-        }),
+        body: serializeUpstreamPayload({ ...payload, maxOutputTokens: payload.maxOutputTokens }),
         signal: AbortSignal.timeout(timeoutMs),
       })
       if (upstreamRes.status !== 200
@@ -271,10 +309,17 @@ export class RunBudgetGuard {
   // reserveIfAffordable calls the estimator synchronously and reserves
   // atomically. Returns the ticket or an error result. Caller MUST NOT
   // contact the upstream before this returns ok.
-  async reserveIfAffordable({ runId, prompt, model, maxOutputTokens }) {
+  //
+  // The estimator receives the full upstream payload (system + messages +
+  // tools + options) — NOT just prompt + model — so a caller cannot smuggle
+  // extra system/tools/messages past the input bound.
+  async reserveIfAffordable({ runId, prompt, model, system, messages, tools, maxOutputTokens }) {
     let bound
-    try { bound = await this.trustedInputUpperBound({ prompt, model }) }
-    catch { return { ok: false, status: 503, error: 'unverified_input_bound' } }
+    try {
+      const upstreamPayload = buildUpstreamPayload({ prompt, model, system, messages, tools, maxOutputTokens })
+      const upstreamBody = JSON.stringify(upstreamPayload)
+      bound = await this.trustedInputUpperBound({ body: upstreamBody, payload: upstreamPayload })
+    } catch { return { ok: false, status: 503, error: 'unverified_input_bound' } }
     if (!isPosInt(bound)) return { ok: false, status: 503, error: 'unverified_input_bound' }
     let ticket
     try { ticket = this.ledger.reserve(runId, bound, maxOutputTokens) }

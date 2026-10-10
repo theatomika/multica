@@ -12,11 +12,14 @@ import (
 )
 
 // TestCreateRetryTaskFireAtControlsDeferral locks in the SQL half of the
-// three-tier provider_network schedule (MUL-4910): CreateRetryTask inserts a
-// 'deferred' child carrying fire_at when the fire_at param is set (the final,
-// backed-off attempt) and an immediately-claimable 'queued' child when it is
-// NULL (every other retry). Both continue the resume chain — force_fresh_session
-// stays false for a provider_network parent.
+// provider_network schedule: CreateRetryTask inserts a 'deferred' child
+// carrying fire_at when the fire_at param is set (the second-and-final retry
+// is backed off ~5s) and an immediately-claimable 'queued' child when it is
+// NULL (the first retry). Both continue the resume chain — force_fresh_session
+// stays false for a provider_network parent. The retry budget itself is
+// owned by the task's own max_attempts column (B4 · 1 prueba / 2 operación):
+// CreateRetryTask writes whatever MaxAttempts the caller passes, defaulting
+// to the parent's column on NULL.
 func TestCreateRetryTaskFireAtControlsDeferral(t *testing.T) {
 	pool := newResolveOriginatorPool(t)
 	ctx := context.Background()
@@ -51,9 +54,12 @@ func TestCreateRetryTaskFireAtControlsDeferral(t *testing.T) {
 		wantFireAt      bool
 		wantMaxAttempts int32
 	}{
-		// Final tier: deferred, and the effective budget (3) written into the row
-		// so it self-describes as attempt=3/max_attempts=3, not attempt=3/max=2.
-		{"deferred final tier persists budget", pgtype.Timestamptz{Time: time.Now().Add(5 * time.Second), Valid: true}, pgtype.Int4{Int32: 3, Valid: true}, "deferred", true, 3},
+		// Deferred retry: caller may pass an explicit budget that the SQL
+		// persists verbatim — useful for non-provider_network paths that pass
+		// 1 to keep the child terminal. The provider_network caller passes
+		// the parent's column (see FailTask), so the row stays self-consistent
+		// at attempt=3/max_attempts=2 under B4.
+		{"deferred retry persists explicit budget", pgtype.Timestamptz{Time: time.Now().Add(5 * time.Second), Valid: true}, pgtype.Int4{Int32: 1, Valid: true}, "deferred", true, 1},
 		// NULL max_attempts inherits the parent's column (COALESCE fallback).
 		{"queued immediate tier inherits budget", pgtype.Timestamptz{}, pgtype.Int4{}, "queued", false, 2},
 	}
@@ -267,10 +273,15 @@ func TestMaybeRetryFailedTaskCopiesChannelDelivery(t *testing.T) {
 	}
 }
 
-// TestFailTaskProviderNetworkBudget is the end-to-end guard for Elon's must-fix
-// (MUL-4910): FailTask must (1) grant provider_network its raised budget and
-// persist a self-consistent child (attempt=3, max_attempts=3), and (2) still
-// honour max_attempts=1 as "auto-retry disabled" — no child at all.
+// TestFailTaskProviderNetworkBudget is the end-to-end guard for the B4
+// contract: FailTask must (1) NEVER widen the per-task budget above the
+// column, so a provider_network task under max=2 has exactly one retry
+// (the budget is exhausted after the second run, no third attempt), and
+// (2) still honour max_attempts=1 as "auto-retry disabled" — no child at
+// all. The deferral backoff (~5s) on the second-and-final attempt is
+// preserved by retryDelayForAttempt; here it does not fire because the
+// second run does not spawn a retry (the workspace sees the failure
+// directly and can decide whether to manually rerun).
 func TestFailTaskProviderNetworkBudget(t *testing.T) {
 	pool := newResolveOriginatorPool(t)
 	ctx := context.Background()
@@ -292,11 +303,12 @@ func TestFailTaskProviderNetworkBudget(t *testing.T) {
 		wantMax      int32
 		wantDeferred bool
 	}{
-		// Default budget, failing on the 2nd attempt → deferred final tier that
-		// records attempt=3 AND max_attempts=3 (no contradictory row).
-		{"final tier persists raised budget", 2, 2, true, 3, 3, true},
-		// Default budget, failing on the 1st attempt → immediate 2nd tier.
-		{"first retry is immediate", 1, 2, true, 2, 3, false},
+		// Default budget (max=2), failing on the 2nd attempt → NO child:
+		// the budget is exhausted (B4: 2 ejecuciones totales por tarea).
+		{"final attempt exhausts budget with no child", 2, 2, false, 0, 0, false},
+		// Default budget, failing on the 1st attempt → immediate 2nd tier,
+		// child records attempt=2, max_attempts=2.
+		{"first retry is immediate", 1, 2, true, 2, 2, false},
 		// max_attempts=1 disables auto-retry — even provider_network gets none.
 		{"disabled budget is never revived", 1, 1, false, 0, 0, false},
 	}

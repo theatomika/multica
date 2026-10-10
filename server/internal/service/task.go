@@ -5281,37 +5281,46 @@ var retryableReasons = map[string]bool{
 // keeps the task's generic max_attempts ceiling and retries immediately.
 const (
 	runtimeOfflineRetryDeferral   = time.Second
+	// providerNetworkMaxAttempts is the historical three-tier ceiling that
+	// retryAttemptCeiling used to raise the per-task budget to. The widening
+	// itself was removed (B4 · policy 1 prueba / 2 operación): the auto-retry
+	// budget is now owned exclusively by the task's own max_attempts column.
+	// The constant is preserved as the deferral threshold for
+	// retryDelayForAttempt, where N-1 still represents the "second-and-final
+	// attempt" boundary under the new contract.
 	providerNetworkMaxAttempts    = 3
 	providerNetworkFinalRetryWait = 5 * time.Second
 )
 
 // retryAttemptCeiling reports how many attempts the auto-retry path allows for
-// a failure reason. It only ever WIDENS the task's generic max_attempts, and
-// only for reasons with a bespoke schedule; everything else keeps the column's
-// value (default 2 = first run + one retry).
+// a failure reason. It returns the task's own max_attempts verbatim; the
+// auto-retry budget is fully owned by the column (default 2 = first run + one
+// retry; 1 = disabled). The function stays as a single chokepoint so that any
+// future bespoke schedule — and only those — can branch on `reason` without
+// re-introducing the prior provider_network widening that effectively raised
+// the per-task budget above the workspace's policy.
 //
 // max_attempts <= 1 explicitly disables auto-retry (055_task_lease_and_retry.up
 // .sql: "1 disables retry"), so it is never overridden — a disabled task must
 // not be revived by a raised ceiling. Callers persist this value into the retry
 // child (CreateRetryTask's max_attempts) so the row stays self-consistent:
-// provider_network's chain records attempt=3, max_attempts=3, not a
-// contradictory attempt=3, max_attempts=2 (MUL-4910).
+// a provider_network retry chain records attempt=N+1, max_attempts=N+1, never
+// attempt=N+1 with the column widened to a third attempt (B4 · policy 1 prueba
+// / 2 operación).
 func retryAttemptCeiling(reason string, taskMaxAttempts int32) int32 {
-	if taskMaxAttempts <= 1 {
-		return taskMaxAttempts
-	}
-	if reason == string(taskfailure.ReasonAgentProviderNetwork) && taskMaxAttempts < providerNetworkMaxAttempts {
-		return providerNetworkMaxAttempts
-	}
 	return taskMaxAttempts
 }
 
 // retryDelayForAttempt reports how long to defer the NEXT attempt after a
 // failure at failedAttempt. runtime_offline always gets a positive fire_at so
-// it waits for the health-gated promotion path. provider_network's final
-// attempt is deferred ~5s; every other retry remains immediate (zero delay →
-// the child is created 'queued', claimable at once). Callers pass the returned
-// delay to CreateRetryTask via fire_at.
+// it waits for the health-gated promotion path. provider_network defers its
+// last permitted retry ~5s so two back-to-back retries cannot happen; the
+// threshold uses providerNetworkMaxAttempts-1 (=2) as the "second-and-final
+// attempt" trigger, matching the B4 policy (1 test en prueba, 2 en operación
+// normal) without widening the budget above the column's value. Every other
+// retryable reason keeps immediate (zero delay → the child is created
+// 'queued', claimable at once). Callers pass the returned delay to
+// CreateRetryTask via fire_at.
 func retryDelayForAttempt(reason string, failedAttempt int32) time.Duration {
 	if reason == string(taskfailure.ReasonRuntimeOffline) {
 		return runtimeOfflineRetryDeferral

@@ -39,3 +39,35 @@ node --test poc/g3-guard/opencode-preflight.test.mjs
 ```
 
 This file does **not** declare G3 real PASS and is **not** a credit budget. It only verifies the catalog-time preflight for provider ids. The per-run accumulated budget control, provider route, hard caps, durable ledger, authentication and run isolation remain unverified and require a separate approval.
+
+## G3 · Per-run accumulated budget guard (offline, MiniMax Messages route)
+
+`poc/g3-guard/run-budget-guard.{mjs,test.mjs}` adds the per-execution budget layer that the catalog preflight cannot provide on its own. It is INDEPENDENT of `provider.use` (which is the global switch) and reuses the lab's `BudgetLedger` as the atomic, fail-closed reservation engine.
+
+What it enforces **before** the upstream is contacted:
+
+- Run identity is explicit (`runId`). The guard never assumes `sessionID === runID`; the `allowSessionFallback` flag is opt-in.
+- Run must be opened with a positive integer credit limit. Unknown / unopened runs → `unknown_run`, zero upstream calls.
+- The estimator must return a positive safe integer upper bound on input tokens. Missing / non-positive → `unverified_input_bound`, zero upstream calls.
+- The reservation must succeed atomically (`ledger.reserve`). Concurrent in-flight calls on the same run cannot oversubscribe.
+- Output cap is enforced server-side: `maxOutputTokens > cap` → `output_cap_exceeded`, zero upstream calls.
+
+What it enforces **after** the upstream returns:
+
+- Settlement only on a complete Anthropic SSE stream ending in `message_stop` with usage inside the reserved bound.
+- Any other path (partial / disconnect / missing usage / upstream protocol error) → `chargeFull`: the FULL reservation is retained, never partially refunded.
+- Retries open a fresh reservation; the prior ticket was either settled by usage or charged in full.
+
+What it does NOT do:
+
+- It does NOT use `4 chars/token + 15%` as an upper bound or a hard cap. The estimator is operator-supplied.
+- It does NOT declare G3 real PASS. The accounting is in SYNTHETIC credits against the run ledger; no USD/EUR price, no provider cache policy, no plan-credit parity.
+- It does NOT replace the global `provider.use` deny; the two layers compose.
+
+WebSocket path: the guard only exposes `POST /v1/run`. WS upgrades to either the sentinel or the guard port do not enter the run accounting path and cannot settle or charge the ledger.
+
+14 focused tests, no network egress, no real provider. Run with:
+
+```
+node --test poc/g3-guard/run-budget-guard.test.mjs
+```

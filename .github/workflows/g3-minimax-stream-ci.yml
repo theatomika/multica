@@ -1,0 +1,23 @@
+name: G3 MiniMax SSE mock one-shot
+on:
+  push:
+    branches:
+      - poc/g3-minimax-contract-20261010
+    paths:
+      - .github/workflows/g3-minimax-stream-ci.yml
+permissions:
+  contents: read
+jobs:
+  sse-mock:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: MiniMax SSE new suite only
+        run: node --test poc/g3-guard/minimax-stream.test.mjs

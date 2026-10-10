@@ -1,0 +1,22 @@
+name: G3 MiniMax Anthropic default mock test
+on:
+  push:
+    branches:
+      - poc/g3-minimax-messages-20261010
+    paths:
+      - .github/workflows/g3-minimax-messages-ci.yml
+permissions:
+  contents: read
+jobs:
+  messages-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: New Messages tests only
+        run: node --test poc/g3-guard/minimax-messages-lab.test.mjs

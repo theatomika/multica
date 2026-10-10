@@ -13,13 +13,21 @@ import (
 
 // TestCreateRetryTaskFireAtControlsDeferral locks in the SQL half of the
 // provider_network schedule: CreateRetryTask inserts a 'deferred' child
-// carrying fire_at when the fire_at param is set (the second-and-final retry
-// is backed off ~5s) and an immediately-claimable 'queued' child when it is
-// NULL (the first retry). Both continue the resume chain — force_fresh_session
-// stays false for a provider_network parent. The retry budget itself is
-// owned by the task's own max_attempts column (B4 · 1 prueba / 2 operación):
-// CreateRetryTask writes whatever MaxAttempts the caller passes, defaulting
-// to the parent's column on NULL.
+// carrying fire_at when the fire_at param is set (the retry is backed off
+// ~5s) and an immediately-claimable 'queued' child when it is NULL. Both
+// continue the resume chain — force_fresh_session stays false for a
+// provider_network parent. The retry budget itself is owned by the task's
+// own max_attempts column (B4 · 1 prueba / 2 operación): the SQL's
+// `COALESCE($3::int, p.max_attempts)` writes whatever MaxAttempts the
+// caller passes, defaulting to the parent's column on NULL.
+//
+// Note on attempt: CreateRetryTask always sets `attempt = parent.attempt +
+// 1`; the budget cap is enforced by retryAttemptCeiling at the caller
+// (FailTask / MaybeRetryFailedTask), not at the SQL layer. The test
+// parent is `attempt=2, max_attempts=2` to exercise the SQL shape
+// directly; under B4 the production caller never reaches CreateRetryTask
+// with that combination (retryEligible becomes false at attempt=2/max=2),
+// so the SQL contract verified here is unchanged.
 func TestCreateRetryTaskFireAtControlsDeferral(t *testing.T) {
 	pool := newResolveOriginatorPool(t)
 	ctx := context.Background()
@@ -33,7 +41,9 @@ func TestCreateRetryTaskFireAtControlsDeferral(t *testing.T) {
 	}
 
 	// Parent: a provider_network failure on its second attempt — the point at
-	// which the schedule wants the next (final) retry deferred.
+	// which the schedule wants the next retry deferred. Under B4 the
+	// production caller would not reach CreateRetryTask here (retryEligible
+	// is false at attempt=2/max=2); the test pins the SQL shape verbatim.
 	var parentID pgtype.UUID
 	if err := pool.QueryRow(ctx, `
 		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority, attempt, max_attempts, failure_reason, session_id, work_dir, channel_context_revision)
@@ -54,12 +64,11 @@ func TestCreateRetryTaskFireAtControlsDeferral(t *testing.T) {
 		wantFireAt      bool
 		wantMaxAttempts int32
 	}{
-		// Deferred retry: caller may pass an explicit budget that the SQL
-		// persists verbatim — useful for non-provider_network paths that pass
-		// 1 to keep the child terminal. The provider_network caller passes
-		// the parent's column (see FailTask), so the row stays self-consistent
-		// at attempt=3/max_attempts=2 under B4.
-		{"deferred retry persists explicit budget", pgtype.Timestamptz{Time: time.Now().Add(5 * time.Second), Valid: true}, pgtype.Int4{Int32: 1, Valid: true}, "deferred", true, 1},
+		// Deferred retry: caller passes MaxAttempts equal to the parent's
+		// column (the value FailTask's retryMaxAttempts carries under B4,
+		// since retryAttemptCeiling returns taskMaxAttempts verbatim). The
+		// SQL persists it verbatim — attempt is always parent.attempt+1=3.
+		{"deferred retry persists caller's budget", pgtype.Timestamptz{Time: time.Now().Add(5 * time.Second), Valid: true}, pgtype.Int4{Int32: 2, Valid: true}, "deferred", true, 2},
 		// NULL max_attempts inherits the parent's column (COALESCE fallback).
 		{"queued immediate tier inherits budget", pgtype.Timestamptz{}, pgtype.Int4{}, "queued", false, 2},
 	}
@@ -282,6 +291,10 @@ func TestMaybeRetryFailedTaskCopiesChannelDelivery(t *testing.T) {
 // preserved by retryDelayForAttempt; here it does not fire because the
 // second run does not spawn a retry (the workspace sees the failure
 // directly and can decide whether to manually rerun).
+//
+// The single retry case uses parent attempt=1/max=2 → child
+// attempt=2/max=2 (the SQL's `attempt + 1` rule plus the unchanged column,
+// since retryAttemptCeiling returns parent.MaxAttempts verbatim under B4).
 func TestFailTaskProviderNetworkBudget(t *testing.T) {
 	pool := newResolveOriginatorPool(t)
 	ctx := context.Background()
@@ -304,10 +317,11 @@ func TestFailTaskProviderNetworkBudget(t *testing.T) {
 		wantDeferred bool
 	}{
 		// Default budget (max=2), failing on the 2nd attempt → NO child:
+		// retryEligible(reason, parent) is false (attempt >= ceiling=2),
 		// the budget is exhausted (B4: 2 ejecuciones totales por tarea).
 		{"final attempt exhausts budget with no child", 2, 2, false, 0, 0, false},
-		// Default budget, failing on the 1st attempt → immediate 2nd tier,
-		// child records attempt=2, max_attempts=2.
+		// Default budget, failing on the 1st attempt → immediate retry,
+		// child records attempt=2, max_attempts=2 (no widening).
 		{"first retry is immediate", 1, 2, true, 2, 2, false},
 		// max_attempts=1 disables auto-retry — even provider_network gets none.
 		{"disabled budget is never revived", 1, 1, false, 0, 0, false},

@@ -19,6 +19,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: false
+          package-manager-cache: false
       - name: Run mock-only budget tests (zero provider calls)
         run: node --test poc/g3-guard/budget-guard.test.mjs

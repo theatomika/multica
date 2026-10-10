@@ -1,0 +1,79 @@
+name: B4 PG17 one-shot verification
+on:
+  push:
+    branches:
+      - 'poc/b4-pg17-4f3c548a-20261010'
+    paths:
+      - '.github/workflows/b4-pg17-isolated.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  b4-postgres:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/poc/b4-pg17-4f3c548a-20261010'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 19
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: multica
+          POSTGRES_PASSWORD: multica
+          POSTGRES_DB: multica
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U multica -d multica"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgres://multica:multica@127.0.0.1:5432/multica?sslmode=disable
+    steps:
+      - name: Checkout exact approved source SHA
+        uses: actions/checkout@v4
+        with:
+          ref: 4f3c548a7eeb7023fce5327ad61a4d52f866986f
+          persist-credentials: false
+      - name: Setup Go 1.26.9 (no cache artifacts)
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.9'
+          cache: false
+      - name: Apply migrations to disposable PostgreSQL
+        working-directory: server
+        run: go run ./cmd/migrate up
+      - name: Run only two real B4 PostgreSQL tests; no skips
+        working-directory: server
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -json ./internal/service -run '^(TestFailTaskProviderNetworkBudget|TestCreateRetryTaskFireAtControlsDeferral)$' -count=1 -timeout=6m | tee /tmp/b4-pg17-test.json
+          python3 - <<'PY'
+          import json
+          required = {
+              'TestFailTaskProviderNetworkBudget',
+              'TestCreateRetryTaskFireAtControlsDeferral',
+          }
+          passed = set()
+          skipped = []
+          failed = []
+          for line in open('/tmp/b4-pg17-test.json', encoding='utf-8'):
+              try:
+                  event = json.loads(line)
+              except json.JSONDecodeError:
+                  continue
+              action = event.get('Action')
+              test = event.get('Test', '')
+              if action == 'skip':
+                  skipped.append(test or '<package>')
+              if action == 'fail':
+                  failed.append(test or '<package>')
+              if action == 'pass' and test in required:
+                  passed.add(test)
+          assert not skipped, f'SKIP not permitted: {skipped}'
+          assert not failed, f'FAIL: {failed}'
+          assert passed == required, f'Expected both tests to execute and pass; got {passed}'
+          print('B4 PG17 VERIFIED: both test functions executed and passed with 0 skips.')
+          PY

@@ -175,26 +175,29 @@ func TestFailTask_AlreadyFinalized(t *testing.T) {
 	}
 }
 
-// TestProviderNetworkRetrySchedule locks in the three-tier schedule for a
-// transient provider stream cut (MUL-4910): first run + immediate retry + one
-// retry deferred ~5s. runtime_offline uses a separate deferred marker so its
-// retry waits for a healthy runtime; other retryable reasons keep their generic
-// max_attempts=2 (single, immediate retry).
+// TestProviderNetworkRetrySchedule locks in the retry schedule for a transient
+// provider stream cut. With B4 the auto-retry budget is fully owned by the
+// task's own max_attempts column (1 prueba / 2 operación): retryAttemptCeiling
+// never widens the budget above the column, only retryDelayForAttempt schedules
+// the backoff on the last permitted retry. runtime_offline uses a separate
+// deferred marker so its retry waits for a healthy runtime; other retryable
+// reasons keep their generic max_attempts=2 (single, immediate retry).
 func TestProviderNetworkRetrySchedule(t *testing.T) {
 	const provNet = "agent_error.provider_network"
 
-	// Attempt ceiling: provider_network is raised to 3, but only ever WIDENS the
-	// budget and never overrides the max_attempts<=1 "retry disabled" contract.
+	// Attempt ceiling: always equals the column's max_attempts. No reason is
+	// allowed to widen the per-task budget above the column value any more,
+	// and max_attempts<=1 ("retry disabled") continues to stay disabled.
 	ceilingCases := []struct {
 		reason string
 		max    int32
 		want   int32
 	}{
-		{provNet, 2, providerNetworkMaxAttempts}, // default budget → raised to 3
-		{provNet, 1, 1},                          // disabled → stays disabled, not revived
-		{provNet, 5, 5},                          // higher configured budget → kept (widen-only)
-		{"timeout", 2, 2},                        // unrelated reason → column value untouched
-		{"timeout", 1, 1},                        // unrelated + disabled → untouched
+		{provNet, 2, 2}, // default budget → kept (no widening)
+		{provNet, 1, 1}, // disabled → stays disabled, not revived
+		{provNet, 5, 5}, // higher configured budget → kept (column is the source of truth)
+		{"timeout", 2, 2}, // unrelated reason → column value untouched
+		{"timeout", 1, 1}, // unrelated + disabled → untouched
 	}
 	for _, tc := range ceilingCases {
 		if got := retryAttemptCeiling(tc.reason, tc.max); got != tc.want {
@@ -203,14 +206,15 @@ func TestProviderNetworkRetrySchedule(t *testing.T) {
 	}
 
 	// Backoff / deferral: runtime_offline always waits for health-gated
-	// promotion; provider_network only defers its final tier.
+	// promotion; provider_network only defers its last permitted retry (the
+	// "second-and-final" boundary under the new contract, N-1 == 2).
 	delayCases := []struct {
 		reason        string
 		failedAttempt int32
 		want          time.Duration
 	}{
 		{provNet, 1, 0}, // first failure → immediate retry
-		{provNet, 2, providerNetworkFinalRetryWait}, // second failure → 5s-deferred retry
+		{provNet, 2, providerNetworkFinalRetryWait}, // second-and-final failure → 5s-deferred retry
 		{"runtime_offline", 1, runtimeOfflineRetryDeferral},
 		{"timeout", 2, 0}, // unrelated reason → never deferred
 	}
@@ -222,6 +226,8 @@ func TestProviderNetworkRetrySchedule(t *testing.T) {
 
 	// Eligibility across the whole chain. mkTask has an issue link and no
 	// autopilot run so only the reason/attempt/ceiling gate is exercised.
+	// Under B4, with max=2, the budget is consumed at attempt=2 (no third
+	// attempt is permitted any more).
 	mkTask := func(attempt, max int32) db.AgentTaskQueue {
 		return db.AgentTaskQueue{
 			Attempt:     attempt,
@@ -237,8 +243,12 @@ func TestProviderNetworkRetrySchedule(t *testing.T) {
 		want    bool
 	}{
 		{"provider_network first run retries", provNet, 1, 2, true},
-		{"provider_network second run still retries (deferred tier)", provNet, 2, 2, true},
-		{"provider_network third run is the ceiling", provNet, 3, 2, false},
+		// Under B4 the per-task budget never widens above max_attempts=2:
+		// attempt=2 IS the second-and-final attempt, so retryEligible must
+		// return false (the run that hit the ceiling is the one that
+		// reports the failure to the workspace; no third attempt is
+		// permitted). The 5s deferral still fires via retryDelayForAttempt.
+		{"provider_network second run is the final attempt", provNet, 2, 2, false},
 		{"provider_network with retry disabled (max_attempts=1) never retries", provNet, 1, 1, false},
 		{"timeout keeps single immediate retry", "timeout", 1, 2, true},
 		{"timeout exhausts at attempt 2", "timeout", 2, 2, false},
@@ -410,11 +420,12 @@ func TestOpencodeStreamEndedFailureRetries(t *testing.T) {
 				if !retryEligible(reason, mkTask(1, 2)) {
 					t.Errorf("retryEligible(%q, attempt=1/max=2) = false, want true", reason)
 				}
-				// And still terminates once the ceiling is reached, so a
-				// deterministically broken provider cannot loop forever.
-				if retryEligible(reason, mkTask(providerNetworkMaxAttempts, 2)) {
-					t.Errorf("retryEligible(%q, attempt=%d/max=2) = true, want false at the ceiling",
-						reason, providerNetworkMaxAttempts)
+				// And still terminates once the per-task budget is exhausted,
+				// so a deterministically broken provider cannot loop forever.
+				// Under B4 the ceiling equals max_attempts verbatim, so any
+				// attempt >= max is terminal.
+				if retryEligible(reason, mkTask(2, 2)) {
+					t.Errorf("retryEligible(%q, attempt=2/max=2) = true, want false at the ceiling", reason)
 				}
 			})
 		}

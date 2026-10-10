@@ -18,6 +18,5 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-          package-manager-cache: false
       - name: MiniMax SSE new suite only
         run: node --test poc/g3-guard/minimax-stream.test.mjs

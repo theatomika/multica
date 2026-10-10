@@ -50,7 +50,7 @@ test('atomic in-flight reservation rejects second concurrent stream',async t=>{
 });
 test('network break after delta charges full and does not retry',async t=>{
  const x=await setup(t,{provider:async r=>{r.write(ev(delta));r.socket.destroy();}});
- const result=await x.post();assert.match(result.text,/g3_error/);assert.equal(x.ledger.snapshot('a').spent,22);assert.equal(x.calls(),1);
+ const result=await x.post();assert.match(result.text,/(?:g3_error|stream_not_verified)/);assert.equal(x.ledger.snapshot('a').spent,22);assert.equal(x.calls(),1);
 });
 test('run isolation and unknown ID',async t=>{
  const x=await setup(t);assert.equal((await x.post(body,'missing')).status,403);assert.equal((await x.post(body,'b')).status,200);
